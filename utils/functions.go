@@ -119,7 +119,6 @@ func getRequestTlsConfig(certBytes, keyBytes, caCertBytes []byte) (conf *tls.Con
 	caBytes := certBytes
 	if caCertBytes != nil {
 		caBytes = caCertBytes
-
 	}
 	ok := serverCertPool.AppendCertsFromPEM(caBytes)
 	if !ok {
@@ -579,9 +578,23 @@ func HttpGet(URL string, timeout int, host ...string) (body []byte, code int, er
 	body, err = ioutil.ReadAll(resp.Body)
 	return
 }
-func IsIternalIP(domainOrIP string) bool {
+func IsIternalIP(domainOrIP string, always bool) bool {
 	var outIPs []net.IP
-	outIPs, err := net.LookupIP(domainOrIP)
+	var err error
+	var isDomain bool
+	if net.ParseIP(domainOrIP) == nil {
+		isDomain = true
+	}
+	if always && isDomain {
+		return false
+	}
+
+	if isDomain {
+		outIPs, err = net.LookupIP(domainOrIP)
+	} else {
+		outIPs = []net.IP{net.ParseIP(domainOrIP)}
+	}
+
 	if err != nil {
 		return false
 	}
@@ -627,12 +640,18 @@ func RemoveProxyHeaders(head []byte) []byte {
 	var keys = map[string]bool{}
 	lines := bytes.Split(head, []byte("\r\n"))
 	IsBody := false
+	i := -1
 	for _, line := range lines {
+		i++
 		if len(line) == 0 || IsBody {
 			newLines = append(newLines, line)
 			IsBody = true
 		} else {
 			hline := bytes.SplitN(line, []byte(":"), 2)
+			if i == 0 && IsHTTP(head) {
+				newLines = append(newLines, line)
+				continue
+			}
 			if len(hline) != 2 {
 				continue
 			}
