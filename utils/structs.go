@@ -3,7 +3,6 @@ package utils
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -12,36 +11,33 @@ import (
 	logger "log"
 	"net"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/snail007/goproxy/services/kcpcfg"
+	"github.com/snail007/goproxy/utils/dnsx"
+	"github.com/snail007/goproxy/utils/mapx"
 	"github.com/snail007/goproxy/utils/sni"
 
 	"github.com/golang/snappy"
-	"github.com/miekg/dns"
 )
 
 type Checker struct {
-	data       ConcurrentMap
-	blockedMap ConcurrentMap
-	directMap  ConcurrentMap
+	data       mapx.ConcurrentMap
+	blockedMap mapx.ConcurrentMap
+	directMap  mapx.ConcurrentMap
 	interval   int64
 	timeout    int
 	isStop     bool
 	log        *logger.Logger
 }
 type CheckerItem struct {
-	IsHTTPS      bool
-	Method       string
-	URL          string
 	Domain       string
-	Host         string
-	Data         []byte
+	Address      string
 	SuccessCount uint
 	FailCount    uint
-	Key          string
+	Lasttime     int64
 }
 
 //NewChecker args:
@@ -49,7 +45,7 @@ type CheckerItem struct {
 //interval: recheck domain interval seconds
 func NewChecker(timeout int, interval int64, blockedFile, directFile string, log *logger.Logger) Checker {
 	ch := Checker{
-		data:     NewConcurrentMap(),
+		data:     mapx.NewConcurrentMap(),
 		interval: interval,
 		timeout:  timeout,
 		isStop:   false,
@@ -70,8 +66,8 @@ func NewChecker(timeout int, interval int64, blockedFile, directFile string, log
 	return ch
 }
 
-func (c *Checker) loadMap(f string) (dataMap ConcurrentMap) {
-	dataMap = NewConcurrentMap()
+func (c *Checker) loadMap(f string) (dataMap mapx.ConcurrentMap) {
+	dataMap = mapx.NewConcurrentMap()
 	if PathExists(f) {
 		_contents, err := ioutil.ReadFile(f)
 		if err != nil {
@@ -92,26 +88,42 @@ func (c *Checker) Stop() {
 }
 func (c *Checker) start() {
 	go func() {
+		defer func() {
+			if e := recover(); e != nil {
+				fmt.Printf("crashed, err: %s\nstack:%s", e, string(debug.Stack()))
+			}
+		}()
 		//log.Printf("checker started")
 		for {
 			//log.Printf("checker did")
 			for _, v := range c.data.Items() {
 				go func(item CheckerItem) {
+					defer func() {
+						if e := recover(); e != nil {
+							fmt.Printf("crashed, err: %s\nstack:%s", e, string(debug.Stack()))
+						}
+					}()
 					if c.isNeedCheck(item) {
 						//log.Printf("check %s", item.Host)
 						var conn net.Conn
 						var err error
-						conn, err = ConnectHost(item.Host, c.timeout)
+						var now = time.Now().Unix()
+						conn, err = ConnectHost(item.Address, c.timeout)
 						if err == nil {
 							conn.SetDeadline(time.Now().Add(time.Millisecond))
 							conn.Close()
+						}
+						if now-item.Lasttime > 1800 {
+							item.FailCount = 0
+							item.SuccessCount = 0
 						}
 						if err != nil {
 							item.FailCount = item.FailCount + 1
 						} else {
 							item.SuccessCount = item.SuccessCount + 1
 						}
-						c.data.Set(item.Host, item)
+						item.Lasttime = now
+						c.data.Set(item.Domain, item)
 					}
 				}(v.(CheckerItem))
 			}
@@ -124,32 +136,37 @@ func (c *Checker) start() {
 }
 func (c *Checker) isNeedCheck(item CheckerItem) bool {
 	var minCount uint = 5
-	if (item.SuccessCount >= minCount && item.SuccessCount > item.FailCount) ||
-		(item.FailCount >= minCount && item.SuccessCount > item.FailCount) ||
-		c.domainIsInMap(item.Host, false) ||
-		c.domainIsInMap(item.Host, true) {
+	var now = time.Now().Unix()
+	if (item.SuccessCount >= minCount && item.SuccessCount > item.FailCount && now-item.Lasttime < 1800) ||
+		(item.FailCount >= minCount && item.SuccessCount > item.FailCount && now-item.Lasttime < 1800) ||
+		c.domainIsInMap(item.Domain, false) ||
+		c.domainIsInMap(item.Domain, true) {
 		return false
 	}
 	return true
 }
-func (c *Checker) IsBlocked(address string) (blocked bool, failN, successN uint) {
-	if c.domainIsInMap(address, true) {
-		//log.Printf("%s in blocked ? true", address)
-		return true, 0, 0
+func (c *Checker) IsBlocked(domain string) (blocked, isInMap bool, failN, successN uint) {
+	h, _, _ := net.SplitHostPort(domain)
+	if h != "" {
+		domain = h
 	}
-	if c.domainIsInMap(address, false) {
+	if c.domainIsInMap(domain, true) {
+		//log.Printf("%s in blocked ? true", address)
+		return true, true, 0, 0
+	}
+	if c.domainIsInMap(domain, false) {
 		//log.Printf("%s in direct ? true", address)
-		return false, 0, 0
+		return false, true, 0, 0
 	}
 
-	_item, ok := c.data.Get(address)
+	_item, ok := c.data.Get(domain)
 	if !ok {
 		//log.Printf("%s not in map, blocked true", address)
-		return true, 0, 0
+		return true, false, 0, 0
 	}
 	item := _item.(CheckerItem)
 
-	return item.FailCount >= item.SuccessCount, item.FailCount, item.SuccessCount
+	return (item.FailCount >= item.SuccessCount) && (time.Now().Unix()-item.Lasttime < 1800), true, item.FailCount, item.SuccessCount
 }
 func (c *Checker) domainIsInMap(address string, blockedMap bool) bool {
 	u, err := url.Parse("http://" + address)
@@ -159,11 +176,9 @@ func (c *Checker) domainIsInMap(address string, blockedMap bool) bool {
 	}
 	domainSlice := strings.Split(u.Hostname(), ".")
 	if len(domainSlice) > 1 {
-		subSlice := domainSlice[:len(domainSlice)-1]
-		topDomain := strings.Join(domainSlice[len(domainSlice)-1:], ".")
-		checkDomain := topDomain
-		for i := len(subSlice) - 1; i >= 0; i-- {
-			checkDomain = subSlice[i] + "." + checkDomain
+		checkDomain := ""
+		for i := len(domainSlice) - 1; i >= 0; i-- {
+			checkDomain = strings.Join(domainSlice[i:], ".")
 			if !blockedMap && c.directMap.Has(checkDomain) {
 				return true
 			}
@@ -174,31 +189,35 @@ func (c *Checker) domainIsInMap(address string, blockedMap bool) bool {
 	}
 	return false
 }
-func (c *Checker) Add(key, address string) {
-	if c.domainIsInMap(key, false) || c.domainIsInMap(key, true) {
+func (c *Checker) Add(domain, address string) {
+	h, _, _ := net.SplitHostPort(domain)
+	if h != "" {
+		domain = h
+	}
+	if c.domainIsInMap(domain, false) || c.domainIsInMap(domain, true) {
 		return
 	}
 	var item CheckerItem
 	item = CheckerItem{
-		Host: address,
-		Key:  key,
+		Domain:  domain,
+		Address: address,
 	}
-	c.data.SetIfAbsent(item.Host, item)
+	c.data.SetIfAbsent(item.Domain, item)
 }
 
 type BasicAuth struct {
-	data        ConcurrentMap
+	data        mapx.ConcurrentMap
 	authURL     string
 	authOkCode  int
 	authTimeout int
 	authRetry   int
-	dns         *DomainResolver
+	dns         *dnsx.DomainResolver
 	log         *logger.Logger
 }
 
-func NewBasicAuth(dns *DomainResolver, log *logger.Logger) BasicAuth {
+func NewBasicAuth(dns *dnsx.DomainResolver, log *logger.Logger) BasicAuth {
 	return BasicAuth{
-		data: NewConcurrentMap(),
+		data: mapx.NewConcurrentMap(),
 		dns:  dns,
 		log:  log,
 	}
@@ -216,7 +235,7 @@ func (ba *BasicAuth) AddFromFile(file string) (n int, err error) {
 	}
 	userpassArr := strings.Split(strings.Replace(string(_content), "\r", "", -1), "\n")
 	for _, userpass := range userpassArr {
-		if strings.HasPrefix("#", userpass) {
+		if strings.HasPrefix(userpass, "#") {
 			continue
 		}
 		u := strings.Split(strings.Trim(userpass, " "), ":")
@@ -329,6 +348,7 @@ type HTTPRequest struct {
 	isBasicAuth bool
 	basicAuth   *BasicAuth
 	log         *logger.Logger
+	IsSNI       bool
 }
 
 func NewHTTPRequest(inConn *net.Conn, bufSize int, isBasicAuth bool, basicAuth *BasicAuth, log *logger.Logger, header ...[]byte) (req HTTPRequest, err error) {
@@ -360,6 +380,7 @@ func NewHTTPRequest(inConn *net.Conn, bufSize int, isBasicAuth bool, basicAuth *
 		//sni success
 		req.Method = "SNI"
 		req.hostOrURL = "https://" + serverName + ":443"
+		req.IsSNI = true
 	} else {
 		//sni fail , try http
 		index := bytes.IndexByte(req.HeadBuf, '\n')
@@ -515,53 +536,15 @@ func (req *HTTPRequest) addPortIfNot() (newHost string) {
 	return
 }
 
-type OutConn struct {
-	dur         int
-	typ         string
-	certBytes   []byte
-	keyBytes    []byte
-	caCertBytes []byte
-	kcp         kcpcfg.KCPConfigArgs
-	address     string
-	timeout     int
-}
-
-func NewOutConn(dur int, typ string, kcp kcpcfg.KCPConfigArgs, certBytes, keyBytes, caCertBytes []byte, address string, timeout int) (op OutConn) {
-	return OutConn{
-		dur:         dur,
-		typ:         typ,
-		certBytes:   certBytes,
-		keyBytes:    keyBytes,
-		caCertBytes: caCertBytes,
-		kcp:         kcp,
-		address:     address,
-		timeout:     timeout,
-	}
-}
-func (op *OutConn) Get() (conn net.Conn, err error) {
-	if op.typ == "tls" {
-		var _conn tls.Conn
-		_conn, err = TlsConnectHost(op.address, op.timeout, op.certBytes, op.keyBytes, op.caCertBytes)
-		if err == nil {
-			conn = net.Conn(&_conn)
-		}
-	} else if op.typ == "kcp" {
-		conn, err = ConnectKCPHost(op.address, op.kcp)
-	} else {
-		conn, err = ConnectHost(op.address, op.timeout)
-	}
-	return
-}
-
 type ConnManager struct {
-	pool ConcurrentMap
+	pool mapx.ConcurrentMap
 	l    *sync.Mutex
 	log  *logger.Logger
 }
 
 func NewConnManager(log *logger.Logger) ConnManager {
 	cm := ConnManager{
-		pool: NewConcurrentMap(),
+		pool: mapx.NewConcurrentMap(),
 		l:    &sync.Mutex{},
 		log:  log,
 	}
@@ -569,11 +552,11 @@ func NewConnManager(log *logger.Logger) ConnManager {
 }
 func (cm *ConnManager) Add(key, ID string, conn *net.Conn) {
 	cm.pool.Upsert(key, nil, func(exist bool, valueInMap interface{}, newValue interface{}) interface{} {
-		var conns ConcurrentMap
+		var conns mapx.ConcurrentMap
 		if !exist {
-			conns = NewConcurrentMap()
+			conns = mapx.NewConcurrentMap()
 		} else {
-			conns = valueInMap.(ConcurrentMap)
+			conns = valueInMap.(mapx.ConcurrentMap)
 		}
 		if conns.Has(ID) {
 			v, _ := conns.Get(ID)
@@ -585,9 +568,9 @@ func (cm *ConnManager) Add(key, ID string, conn *net.Conn) {
 	})
 }
 func (cm *ConnManager) Remove(key string) {
-	var conns ConcurrentMap
+	var conns mapx.ConcurrentMap
 	if v, ok := cm.pool.Get(key); ok {
-		conns = v.(ConcurrentMap)
+		conns = v.(mapx.ConcurrentMap)
 		conns.IterCb(func(key string, v interface{}) {
 			CloseConn(v.(*net.Conn))
 		})
@@ -598,9 +581,9 @@ func (cm *ConnManager) Remove(key string) {
 func (cm *ConnManager) RemoveOne(key string, ID string) {
 	defer cm.l.Unlock()
 	cm.l.Lock()
-	var conns ConcurrentMap
+	var conns mapx.ConcurrentMap
 	if v, ok := cm.pool.Get(key); ok {
-		conns = v.(ConcurrentMap)
+		conns = v.(mapx.ConcurrentMap)
 		if conns.Has(ID) {
 			v, _ := conns.Get(ID)
 			(*v.(*net.Conn)).Close()
@@ -618,11 +601,11 @@ func (cm *ConnManager) RemoveAll() {
 
 type ClientKeyRouter struct {
 	keyChan chan string
-	ctrl    *ConcurrentMap
+	ctrl    *mapx.ConcurrentMap
 	lock    *sync.Mutex
 }
 
-func NewClientKeyRouter(ctrl *ConcurrentMap, size int) ClientKeyRouter {
+func NewClientKeyRouter(ctrl *mapx.ConcurrentMap, size int) ClientKeyRouter {
 	return ClientKeyRouter{
 		keyChan: make(chan string, size),
 		ctrl:    ctrl,
@@ -658,103 +641,6 @@ func (c *ClientKeyRouter) GetKey() string {
 
 }
 
-type DomainResolver struct {
-	ttl         int
-	dnsAddrress string
-	data        ConcurrentMap
-	log         *logger.Logger
-}
-type DomainResolverItem struct {
-	ip        string
-	domain    string
-	expiredAt int64
-}
-
-func NewDomainResolver(dnsAddrress string, ttl int, log *logger.Logger) DomainResolver {
-	return DomainResolver{
-		ttl:         ttl,
-		dnsAddrress: dnsAddrress,
-		data:        NewConcurrentMap(),
-		log:         log,
-	}
-}
-func (a *DomainResolver) MustResolve(address string) (ip string) {
-	ip, _ = a.Resolve(address)
-	return
-}
-func (a *DomainResolver) Resolve(address string) (ip string, err error) {
-	domain := address
-	port := ""
-	fromCache := "false"
-	defer func() {
-		if port != "" {
-			ip = net.JoinHostPort(ip, port)
-		}
-		a.log.Printf("dns:%s->%s,cache:%s", address, ip, fromCache)
-		//a.PrintData()
-	}()
-	if strings.Contains(domain, ":") {
-		domain, port, err = net.SplitHostPort(domain)
-		if err != nil {
-			return
-		}
-	}
-	if net.ParseIP(domain) != nil {
-		ip = domain
-		fromCache = "ip ignore"
-		return
-	}
-	item, ok := a.data.Get(domain)
-	if ok {
-		//log.Println("find ", domain)
-		if (*item.(*DomainResolverItem)).expiredAt > time.Now().Unix() {
-			ip = (*item.(*DomainResolverItem)).ip
-			fromCache = "true"
-			//log.Println("from cache ", domain)
-			return
-		}
-	} else {
-		item = &DomainResolverItem{
-			domain: domain,
-		}
-
-	}
-	c := new(dns.Client)
-	c.DialTimeout = time.Millisecond * 5000
-	c.ReadTimeout = time.Millisecond * 5000
-	c.WriteTimeout = time.Millisecond * 5000
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
-	m.RecursionDesired = true
-	r, _, err := c.Exchange(m, a.dnsAddrress)
-	if r == nil {
-		return
-	}
-	if r.Rcode != dns.RcodeSuccess {
-		err = fmt.Errorf(" *** invalid answer name %s after A query for %s", domain, a.dnsAddrress)
-		return
-	}
-	for _, answer := range r.Answer {
-		if answer.Header().Rrtype == dns.TypeA {
-			info := strings.Fields(answer.String())
-			if len(info) >= 5 {
-				ip = info[4]
-				_item := item.(*DomainResolverItem)
-				(*_item).expiredAt = time.Now().Unix() + int64(a.ttl)
-				(*_item).ip = ip
-				a.data.Set(domain, item)
-				return
-			}
-		}
-	}
-	return
-}
-func (a *DomainResolver) PrintData() {
-	for k, item := range a.data.Items() {
-		d := item.(*DomainResolverItem)
-		a.log.Printf("%s:ip[%s],domain[%s],expired at[%d]\n", k, (*d).ip, (*d).domain, (*d).expiredAt)
-	}
-}
 func NewCompStream(conn net.Conn) *CompStream {
 	c := new(CompStream)
 	c.conn = conn
